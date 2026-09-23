@@ -7,7 +7,7 @@ const DEBUG_MODE = false;
 
 // Mapping of TLS versions to their JA4 representation
 const TLS_MAPPER = {
-  '0x0002': 's2', // SSL 2.0  
+  '0x0002': 's2', // SSL 2.0
   '0x0300': 's3', // SSL 3.0
   '0x0301': '10', // TLS 1.0
   '0x0302': '11', // TLS 1.1
@@ -28,6 +28,9 @@ const GREASE_VALUES = new Set([
  * @returns {Uint8Array} The resulting Uint8Array.
  */
 export function base64toUint8Array(base64_string) {
+  if (typeof base64_string !== 'string') {
+    return new Uint8Array(0);
+  }
   const binary_string = atob(base64_string);
   const len = binary_string.length;
   const bytes = new Uint8Array(len);
@@ -66,10 +69,17 @@ function isPrintableAscii(charCode) {
  * @returns {string} The calculated JA4 fingerprint.
  */
 export async function getJA4Fingerprint(buffer, proto) {
-  const dataView = new DataView(buffer.buffer);
+  if (!buffer || !(buffer instanceof Uint8Array)) {
+    throw new Error('Invalid buffer provided');
+  }
+  const dataView = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
 
   try {
     let currentIndex = 4; // Skip handshake type and length
+
+    if (buffer.length < currentIndex + 34) {
+      throw new Error('Buffer too short for TLS version and Client Random');
+    }
 
     // Extract TLS version
     const tlsVersion = `0x${dataView.getUint16(currentIndex).toString(16).padStart(4, '0')}`;
@@ -77,12 +87,25 @@ export async function getJA4Fingerprint(buffer, proto) {
     currentIndex += 34; // Skip over TLS version and client random
 
     // Skip session ID
+    if (buffer.length < currentIndex + 1) {
+      throw new Error('Buffer too short for Session ID length');
+    }
     const sessionIDLength = dataView.getUint8(currentIndex);
-    currentIndex += 1 + sessionIDLength;
+    currentIndex += 1;
+    if (buffer.length < currentIndex + sessionIDLength) {
+      throw new Error('Buffer too short for Session ID payload');
+    }
+    currentIndex += sessionIDLength;
 
     // Extract cipher suites
+    if (buffer.length < currentIndex + 2) {
+      throw new Error('Buffer too short for Cipher Suites length');
+    }
     const cipherSuitesLength = dataView.getUint16(currentIndex);
     currentIndex += 2;
+    if (buffer.length < currentIndex + cipherSuitesLength) {
+      throw new Error('Buffer too short for Cipher Suites payload');
+    }
     const cipherSuites = [];
     for (let i = 0; i < cipherSuitesLength; i += 2) {
       const cipher = dataView.getUint16(currentIndex + i);
@@ -93,12 +116,29 @@ export async function getJA4Fingerprint(buffer, proto) {
     currentIndex += cipherSuitesLength;
 
     // Skip compression methods
+    if (buffer.length < currentIndex + 1) {
+      throw new Error('Buffer too short for Compression Methods length');
+    }
     const compressionMethodsLength = dataView.getUint8(currentIndex);
-    currentIndex += 1 + compressionMethodsLength;
+    currentIndex += 1;
+    if (buffer.length < currentIndex + compressionMethodsLength) {
+      throw new Error('Buffer too short for Compression Methods payload');
+    }
+    currentIndex += compressionMethodsLength;
 
     // Process extensions
-    const extensionsLength = dataView.getUint16(currentIndex);
-    currentIndex += 2;
+    let extensionsLength = 0;
+    if (currentIndex < buffer.length) {
+      if (buffer.length < currentIndex + 2) {
+        throw new Error('Buffer too short for Extensions length');
+      }
+      extensionsLength = dataView.getUint16(currentIndex);
+      currentIndex += 2;
+      if (buffer.length < currentIndex + extensionsLength) {
+        throw new Error('Buffer too short for Extensions payload');
+      }
+    }
+
     const extensionsList = [];
     let sni = 'i';
     let alpn = '00'; // Default value if no ALPN extension or values
@@ -107,9 +147,16 @@ export async function getJA4Fingerprint(buffer, proto) {
 
     const extensionsEndIndex = currentIndex + extensionsLength;
     while (currentIndex < extensionsEndIndex) {
+      if (currentIndex + 4 > extensionsEndIndex) {
+        throw new Error('Buffer too short for extension header');
+      }
       const extType = dataView.getUint16(currentIndex);
       const extLength = dataView.getUint16(currentIndex + 2);
       currentIndex += 4;
+
+      if (currentIndex + extLength > extensionsEndIndex) {
+        throw new Error('Extension length exceeds extensions payload boundary');
+      }
 
       if (!GREASE_VALUES.has(extType)) {
         const extTypeHex = extType.toString(16).padStart(4, '0');
@@ -118,39 +165,53 @@ export async function getJA4Fingerprint(buffer, proto) {
         if (extType === 0x0000) { // SNI
           sni = 'd';
         } else if (extType === 0x0010) { // ALPN
-          const alpnListLength = dataView.getUint16(currentIndex);
-          let alpnOffset = currentIndex + 2;
-          const alpnEndOffset = alpnOffset + alpnListLength;
-          
-          if (alpnOffset < alpnEndOffset) {
-            const protocolLength = dataView.getUint8(alpnOffset);
-            alpnOffset++;
+          if (extLength >= 2) {
+            const alpnListLength = dataView.getUint16(currentIndex);
+            let alpnOffset = currentIndex + 2;
+            const alpnEndOffset = alpnOffset + alpnListLength;
 
-            if (protocolLength > 0) {
-              const firstChar = dataView.getUint8(alpnOffset);
-              const lastChar = dataView.getUint8(alpnOffset + protocolLength - 1);
+            if (alpnEndOffset <= currentIndex + extLength && alpnOffset < alpnEndOffset) {
+              const protocolLength = dataView.getUint8(alpnOffset);
+              alpnOffset++;
 
-              if (isPrintableAscii(firstChar) && isPrintableAscii(lastChar)) {
-                alpn = String.fromCharCode(firstChar) + String.fromCharCode(lastChar);
-              } else {
-                alpn = ((firstChar >> 4) & 0x0F).toString(16) + (lastChar & 0x0F).toString(16);
+              if (protocolLength > 0 && alpnOffset + protocolLength <= alpnEndOffset) {
+                const firstChar = dataView.getUint8(alpnOffset);
+                const lastChar = dataView.getUint8(alpnOffset + protocolLength - 1);
+
+                if (isPrintableAscii(firstChar) && isPrintableAscii(lastChar)) {
+                  alpn = String.fromCharCode(firstChar) + String.fromCharCode(lastChar);
+                } else {
+                  alpn = ((firstChar >> 4) & 0x0F).toString(16) + (lastChar & 0x0F).toString(16);
+                }
               }
             }
           }
         } else if (extType === 0x002b) { // Supported Versions
-          const supportedVersionsLength = dataView.getUint8(currentIndex);
-          for (let i = 0; i < supportedVersionsLength; i += 2) {
-            const version = dataView.getUint16(currentIndex + 1 + i);
-            if (!GREASE_VALUES.has(version)) {
-              supportedVersions.push(version);
+          if (extLength >= 1) {
+            const supportedVersionsLength = dataView.getUint8(currentIndex);
+            if (1 + supportedVersionsLength <= extLength) {
+              for (let i = 0; i < supportedVersionsLength; i += 2) {
+                if (currentIndex + 1 + i + 2 <= currentIndex + extLength) {
+                  const version = dataView.getUint16(currentIndex + 1 + i);
+                  if (!GREASE_VALUES.has(version)) {
+                    supportedVersions.push(version);
+                  }
+                }
+              }
             }
           }
         } else if (extType === 0x000d) { // Signature Algorithms
-          const sigAlgLength = dataView.getUint16(currentIndex);
-          for (let i = 0; i < sigAlgLength; i += 2) {
-            const alg = dataView.getUint16(currentIndex + 2 + i);
-            if (!GREASE_VALUES.has(alg)) {
-              signatureAlgorithms.push(alg.toString(16).padStart(4, '0'));
+          if (extLength >= 2) {
+            const sigAlgLength = dataView.getUint16(currentIndex);
+            if (2 + sigAlgLength <= extLength) {
+              for (let i = 0; i < sigAlgLength; i += 2) {
+                if (currentIndex + 2 + i + 2 <= currentIndex + extLength) {
+                  const alg = dataView.getUint16(currentIndex + 2 + i);
+                  if (!GREASE_VALUES.has(alg)) {
+                    signatureAlgorithms.push(alg.toString(16).padStart(4, '0'));
+                  }
+                }
+              }
             }
           }
         }
@@ -187,7 +248,7 @@ export async function getJA4Fingerprint(buffer, proto) {
     const ja4Base = `${ptype}${tlsMappedVersion}${sni}${numCiphers}${numExtensions}${alpn}`;
     const ja4 = `${ja4Base}_${ja4CipherHash}_${ja4ExtensionHash}`;
     const ja4_r = `${ja4Base}_${cipherSuitesString}_${extensionHashInput}`;
-    
+
     logger.debug(`JA4: ${ja4}`);
     logger.debug(`JA4_r: ${ja4_r}`);
 
@@ -199,7 +260,7 @@ export async function getJA4Fingerprint(buffer, proto) {
 
       const ja4_ro = `${ja4Base}_${cipherSuitesString}_${extensionsList.join(',')}_${signatureAlgorithms.join(',')}`;
       const ja4_o = `${ja4Base}_${ja4CipherHash}_${ja4OriginalExtensionHash}`;
-    
+
       logger.debug(`JA4_ro: ${ja4_ro}`);
       logger.debug(`JA4_o: ${ja4_o}`);
     }
